@@ -52,19 +52,19 @@ This simulation recreates these phenomena in real time on your GPU.
 
 - **Interactive CAD-Style Camera** — Full orbit, zoom, and pan controls. Inspect the black hole from any angle in real time.
 
-  https://github.com/user-attachments/assets/wasd_camera_demo.mp4
+  https://github.com/user-attachments/assets/d0b152b4-3ae9-4057-8ffa-498949765ca8
 
 ---
 
 ## Demo Videos
 
 ### WASD Camera Navigation
-https://github.com/user-attachments/assets/wasd_camera_demo.mp4
+https://github.com/user-attachments/assets/d0b152b4-3ae9-4057-8ffa-498949765ca8
 
 *Full orbit, zoom, and pan around the black hole using mouse drag and WASD keys.*
 
 ### Particle Flow Close-Up
-https://github.com/user-attachments/assets/particle_flow_demo.mp4
+https://github.com/user-attachments/assets/ee758a30-f8ba-451b-b708-1f91eae35b5a
 
 *Individual particles orbiting at Keplerian velocity — inner particles visibly move faster than outer ones.*
 
