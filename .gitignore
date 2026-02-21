@@ -22,8 +22,11 @@ CTestTestfile.cmake
 *~
 .DS_Store
 
+# AI assistant
+.agents/
+.gemini/
+
 # Executables
-tests/
 *.exe
 *.out
 
@@ -33,4 +36,5 @@ tests/
 #misc
 *.log
 todo.md
+
 

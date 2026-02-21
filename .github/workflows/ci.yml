@@ -1,0 +1,36 @@
+name: CI — Core Engine Tests
+
+on:
+  push:
+    branches: [ main, master, dev ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    name: Build & Test (Ubuntu)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libglfw3-dev libgl1-mesa-dev
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build tests
+        run: cmake --build build --target vec3_test vec4_test physics_test -j$(nproc)
+
+      - name: Run Vec3 tests
+        run: ./build/tests/vec3_test
+
+      - name: Run Vec4 tests
+        run: ./build/tests/vec4_test
+
+      - name: Run Physics tests
+        run: ./build/tests/physics_test

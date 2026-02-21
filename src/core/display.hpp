@@ -14,20 +14,31 @@ private:
     int window_width, window_height;
     GLFWwindow* window;
 
-    // Shader program
-    GLuint shaderProgram;
+    // --- Shaders ---
+    GLuint sceneProgram;     // blackhole.vert + blackhole.frag
+    GLuint blurProgram;      // blackhole.vert + bloom_blur.frag
+    GLuint compositeProgram; // blackhole.vert + bloom_final.frag
 
-    // Full-screen quad
+    // --- Full-screen quad ---
     GLuint quadVAO, quadVBO;
 
-    // --- Shader compilation utility ---
+    // --- Framebuffers for bloom pipeline ---
+    GLuint sceneFBO, sceneTexture;       // Scene renders here (HDR)
+    GLuint pingFBO, pingTexture;         // Blur ping
+    GLuint pongFBO, pongTexture;         // Blur pong
+
+    // --- Bloom parameters ---
+    int bloomIterations;
+    float bloomStrength;
+    float exposure;
+
+    // --- Shader utilities ---
     GLuint compileShader(GLenum type, const std::string& source) {
         GLuint shader = glCreateShader(type);
         const char* src = source.c_str();
         glShaderSource(shader, 1, &src, nullptr);
         glCompileShader(shader);
 
-        // Check for errors
         int success;
         glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
         if (!success) {
@@ -52,18 +63,65 @@ private:
         return buffer.str();
     }
 
+    GLuint linkProgram(GLuint vert, GLuint frag) {
+        GLuint prog = glCreateProgram();
+        glAttachShader(prog, vert);
+        glAttachShader(prog, frag);
+        glLinkProgram(prog);
+
+        int success;
+        glGetProgramiv(prog, GL_LINK_STATUS, &success);
+        if (!success) {
+            char infoLog[1024];
+            glGetProgramInfoLog(prog, 1024, nullptr, infoLog);
+            std::cerr << "SHADER LINK ERROR:\n" << infoLog << std::endl;
+        }
+        return prog;
+    }
+
+    void createFBO(GLuint& fbo, GLuint& tex, int w, int h) {
+        glGenFramebuffers(1, &fbo);
+        glGenTextures(1, &tex);
+
+        glBindTexture(GL_TEXTURE_2D, tex);
+        // Use RGBA16F for HDR storage
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA, GL_FLOAT, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            std::cerr << "ERROR: Framebuffer not complete!" << std::endl;
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+
+    void resizeFBOs(int w, int h) {
+        auto resizeTex = [](GLuint tex, int w, int h) {
+            glBindTexture(GL_TEXTURE_2D, tex);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA, GL_FLOAT, nullptr);
+        };
+        resizeTex(sceneTexture, w, h);
+        resizeTex(pingTexture, w, h);
+        resizeTex(pongTexture, w, h);
+    }
+
 public:
     Display(int width, int height, const std::string& title,
-            const std::string& vertPath, const std::string& fragPath)
-        : window_width(width), window_height(height) {
-
+            const std::string& shaderDir)
+        : window_width(width), window_height(height),
+          bloomIterations(8), bloomStrength(0.15f), exposure(1.2f)
+    {
         // --- GLFW Init ---
         if (!glfwInit()) {
             std::cerr << "Failed to initialize GLFW" << std::endl;
             return;
         }
 
-        // Request OpenGL 3.3 Core Profile
         glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
         glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
         glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
@@ -76,17 +134,15 @@ public:
         }
 
         glfwMakeContextCurrent(window);
-        glfwSwapInterval(1); // VSync on — prevents GPU from overworking
+        glfwSwapInterval(1);
 
-        // Store 'this' pointer so the resize callback can update our dimensions
         glfwSetWindowUserPointer(window, this);
-
-        // Framebuffer resize callback — keeps viewport matched to window size
         glfwSetFramebufferSizeCallback(window, [](GLFWwindow* w, int newW, int newH) {
             Display* self = static_cast<Display*>(glfwGetWindowUserPointer(w));
             if (self) {
                 self->window_width = newW;
                 self->window_height = newH;
+                self->resizeFBOs(newW, newH);
             }
             glViewport(0, 0, newW, newH);
         });
@@ -99,102 +155,133 @@ public:
         std::cout << "OpenGL Version: " << glGetString(GL_VERSION) << std::endl;
         std::cout << "GPU: " << glGetString(GL_RENDERER) << std::endl;
 
-        // --- Build full-screen quad ---
-        // Two triangles covering [-1,1] in NDC with UVs [0,1]
-        float quadVertices[] = {
-            // pos.x  pos.y   uv.x  uv.y
-            -1.0f, -1.0f,   0.0f, 0.0f,
-             1.0f, -1.0f,   1.0f, 0.0f,
-             1.0f,  1.0f,   1.0f, 1.0f,
-
-            -1.0f, -1.0f,   0.0f, 0.0f,
-             1.0f,  1.0f,   1.0f, 1.0f,
-            -1.0f,  1.0f,   0.0f, 1.0f,
+        // --- Fullscreen quad ---
+        float quadVerts[] = {
+            -1.0f, -1.0f,  0.0f, 0.0f,
+             1.0f, -1.0f,  1.0f, 0.0f,
+             1.0f,  1.0f,  1.0f, 1.0f,
+            -1.0f, -1.0f,  0.0f, 0.0f,
+             1.0f,  1.0f,  1.0f, 1.0f,
+            -1.0f,  1.0f,  0.0f, 1.0f,
         };
 
         glGenVertexArrays(1, &quadVAO);
         glGenBuffers(1, &quadVBO);
         glBindVertexArray(quadVAO);
         glBindBuffer(GL_ARRAY_BUFFER, quadVBO);
-        glBufferData(GL_ARRAY_BUFFER, sizeof(quadVertices), quadVertices, GL_STATIC_DRAW);
-
-        // Position attribute (location = 0)
+        glBufferData(GL_ARRAY_BUFFER, sizeof(quadVerts), quadVerts, GL_STATIC_DRAW);
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
         glEnableVertexAttribArray(0);
-
-        // UV attribute (location = 1)
         glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
         glEnableVertexAttribArray(1);
-
         glBindVertexArray(0);
 
-        // --- Compile & link shaders ---
-        std::string vertSrc = loadShaderFile(vertPath);
-        std::string fragSrc = loadShaderFile(fragPath);
+        // --- Create bloom FBOs (RGBA16F for HDR) ---
+        createFBO(sceneFBO, sceneTexture, width, height);
+        createFBO(pingFBO, pingTexture, width, height);
+        createFBO(pongFBO, pongTexture, width, height);
 
-        if (vertSrc.empty() || fragSrc.empty()) {
-            std::cerr << "Failed to load shader files!" << std::endl;
-            return;
-        }
+        // --- Compile all shader programs ---
+        std::string vertSrc = loadShaderFile(shaderDir + "/blackhole.vert");
+        std::string fragScene = loadShaderFile(shaderDir + "/blackhole.frag");
+        std::string fragBlur = loadShaderFile(shaderDir + "/bloom_blur.frag");
+        std::string fragComp = loadShaderFile(shaderDir + "/bloom_final.frag");
 
-        GLuint vertShader = compileShader(GL_VERTEX_SHADER, vertSrc);
-        GLuint fragShader = compileShader(GL_FRAGMENT_SHADER, fragSrc);
+        GLuint vert = compileShader(GL_VERTEX_SHADER, vertSrc);
+        GLuint fScene = compileShader(GL_FRAGMENT_SHADER, fragScene);
+        GLuint fBlur = compileShader(GL_FRAGMENT_SHADER, fragBlur);
+        GLuint fComp = compileShader(GL_FRAGMENT_SHADER, fragComp);
 
-        if (!vertShader || !fragShader) {
-            std::cerr << "Shader compilation failed! Aborting." << std::endl;
-            return;
-        }
+        sceneProgram = linkProgram(vert, fScene);
+        blurProgram = linkProgram(vert, fBlur);
+        compositeProgram = linkProgram(vert, fComp);
 
-        shaderProgram = glCreateProgram();
-        glAttachShader(shaderProgram, vertShader);
-        glAttachShader(shaderProgram, fragShader);
-        glLinkProgram(shaderProgram);
-
-        // Check linking
-        int success;
-        glGetProgramiv(shaderProgram, GL_LINK_STATUS, &success);
-        if (!success) {
-            char infoLog[1024];
-            glGetProgramInfoLog(shaderProgram, 1024, nullptr, infoLog);
-            std::cerr << "SHADER LINK ERROR:\n" << infoLog << std::endl;
-        }
-
-        // Clean up individual shaders (they're now in the program)
-        glDeleteShader(vertShader);
-        glDeleteShader(fragShader);
-
-        // Activate the shader program
-        glUseProgram(shaderProgram);
+        glDeleteShader(vert);
+        glDeleteShader(fScene);
+        glDeleteShader(fBlur);
+        glDeleteShader(fComp);
     }
 
     ~Display() {
+        glDeleteFramebuffers(1, &sceneFBO);
+        glDeleteFramebuffers(1, &pingFBO);
+        glDeleteFramebuffers(1, &pongFBO);
+        glDeleteTextures(1, &sceneTexture);
+        glDeleteTextures(1, &pingTexture);
+        glDeleteTextures(1, &pongTexture);
         glDeleteVertexArrays(1, &quadVAO);
         glDeleteBuffers(1, &quadVBO);
-        glDeleteProgram(shaderProgram);
-
-        if (window) {
-            glfwDestroyWindow(window);
-        }
+        glDeleteProgram(sceneProgram);
+        glDeleteProgram(blurProgram);
+        glDeleteProgram(compositeProgram);
+        if (window) glfwDestroyWindow(window);
         glfwTerminate();
     }
 
-    // --- Uniform setters ---
+    // --- Use the scene shader for setting uniforms ---
+    void useSceneShader() {
+        glUseProgram(sceneProgram);
+    }
+
+    // --- Set uniforms on the currently active program ---
     void setUniform1f(const char* name, float v) {
-        glUniform1f(glGetUniformLocation(shaderProgram, name), v);
+        glUniform1f(glGetUniformLocation(sceneProgram, name), v);
     }
-
     void setUniform2f(const char* name, float x, float y) {
-        glUniform2f(glGetUniformLocation(shaderProgram, name), x, y);
+        glUniform2f(glGetUniformLocation(sceneProgram, name), x, y);
     }
-
     void setUniform3f(const char* name, float x, float y, float z) {
-        glUniform3f(glGetUniformLocation(shaderProgram, name), x, y, z);
+        glUniform3f(glGetUniformLocation(sceneProgram, name), x, y, z);
     }
 
-    // --- Draw the full-screen quad (triggers fragment shader on every pixel) ---
+    // --- Full bloom render pipeline ---
     void draw() {
+        // ===== PASS 1: Render black hole scene to HDR FBO =====
+        glUseProgram(sceneProgram);
+        glBindFramebuffer(GL_FRAMEBUFFER, sceneFBO);
         glClear(GL_COLOR_BUFFER_BIT);
         glBindVertexArray(quadVAO);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+
+        // ===== PASS 2: Gaussian blur (ping-pong) =====
+        glUseProgram(blurProgram);
+        bool horizontal = true;
+        bool firstPass = true;
+
+        for (int i = 0; i < bloomIterations * 2; i++) {
+            glBindFramebuffer(GL_FRAMEBUFFER, horizontal ? pingFBO : pongFBO);
+            glUniform1i(glGetUniformLocation(blurProgram, "uHorizontal"), horizontal);
+
+            // First pass reads from scene; subsequent passes ping-pong
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, firstPass ? sceneTexture : (horizontal ? pongTexture : pingTexture));
+            glUniform1i(glGetUniformLocation(blurProgram, "uImage"), 0);
+
+            glClear(GL_COLOR_BUFFER_BIT);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+
+            horizontal = !horizontal;
+            firstPass = false;
+        }
+
+        // ===== PASS 3: Composite scene + bloom to screen =====
+        glUseProgram(compositeProgram);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0); // Default framebuffer (screen)
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        // Bind scene texture to unit 0
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, sceneTexture);
+        glUniform1i(glGetUniformLocation(compositeProgram, "uScene"), 0);
+
+        // Bind bloom (last blurred result) to unit 1
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, horizontal ? pongTexture : pingTexture);
+        glUniform1i(glGetUniformLocation(compositeProgram, "uBloom"), 1);
+
+        glUniform1f(glGetUniformLocation(compositeProgram, "uBloomStrength"), bloomStrength);
+        glUniform1f(glGetUniformLocation(compositeProgram, "uExposure"), exposure);
+
         glDrawArrays(GL_TRIANGLES, 0, 6);
         glBindVertexArray(0);
 
@@ -202,15 +289,14 @@ public:
         glfwPollEvents();
     }
 
-    bool shouldClose() {
-        return glfwWindowShouldClose(window);
-    }
-
-    bool isKeyPressed(int key) {
-        return glfwGetKey(window, key) == GLFW_PRESS;
-    }
-
+    bool shouldClose() { return glfwWindowShouldClose(window); }
+    bool isKeyPressed(int key) { return glfwGetKey(window, key) == GLFW_PRESS; }
     GLFWwindow* getWindow() { return window; }
     int getWidth() const { return window_width; }
     int getHeight() const { return window_height; }
+
+    // --- Bloom tuning ---
+    void setBloomStrength(float s) { bloomStrength = s; }
+    void setBloomIterations(int n) { bloomIterations = n; }
+    void setExposure(float e) { exposure = e; }
 };

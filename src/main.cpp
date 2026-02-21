@@ -1,7 +1,7 @@
 // ============================================================
 //  Schwarzschild Black Hole — Phase 5: GPU Fragment Shader
-//  All physics runs in blackhole.frag on the RTX 4070
-//  CPU only: pass uniforms → draw 2 triangles → done
+//  Multi-pass HDR bloom pipeline on RTX 4070
+//  CPU only: pass uniforms → draw 2 triangles → bloom → done
 // ============================================================
 
 #include <iostream>
@@ -18,34 +18,32 @@ const int HEIGHT = 600;
 Camera* g_camera = nullptr;
 
 // --- GLFW Callbacks ---
-void mouseButtonCallback(GLFWwindow* /*window*/, int button, int action, int /*mods*/) {
+void mouseButtonCallback(GLFWwindow*, int button, int action, int) {
     if (g_camera) g_camera->onMouseButton(button, action);
 }
 
-void cursorPosCallback(GLFWwindow* /*window*/, double xpos, double ypos) {
+void cursorPosCallback(GLFWwindow*, double xpos, double ypos) {
     if (g_camera) g_camera->onMouseMove(xpos, ypos);
 }
 
-void scrollCallback(GLFWwindow* /*window*/, double /*xoffset*/, double yoffset) {
+void scrollCallback(GLFWwindow*, double, double yoffset) {
     if (g_camera) g_camera->onScroll(yoffset);
 }
 
 int main() {
     std::cout << "===================================\n";
     std::cout << " Schwarzschild Black Hole Engine\n";
-    std::cout << " Phase 5: GPU Fragment Shader\n";
+    std::cout << " Phase 5: GPU + HDR Bloom\n";
     std::cout << "===================================\n\n";
 
-    // Resolve shader paths relative to executable
-    // Shaders are in src/shaders/ relative to project root
-    std::string vertPath = "../src/shaders/blackhole.vert";
-    std::string fragPath = "../src/shaders/blackhole.frag";
+    // Shader directory (relative to build/)
+    std::string shaderDir = "../src/shaders";
 
-    // 1. Initialize Display (compiles shaders, creates fullscreen quad)
-    Display display(WIDTH, HEIGHT, "Schwarzschild Black Hole", vertPath, fragPath);
+    // 1. Initialize Display (compiles 3 shader programs, creates bloom FBOs)
+    Display display(WIDTH, HEIGHT, "Schwarzschild Black Hole", shaderDir);
 
     // 2. Initialize Orbit Camera
-    Camera camera(15.0f, 0.0f, 0.3f);  // radius=15, yaw=0, pitch=0.3 rad (~17°)
+    Camera camera(15.0f, 0.0f, 0.3f);
     g_camera = &camera;
 
     // 3. Register input callbacks
@@ -54,22 +52,22 @@ int main() {
     glfwSetCursorPosCallback(win, cursorPosCallback);
     glfwSetScrollCallback(win, scrollCallback);
 
-    // ESC to close
     glfwSetKeyCallback(win, [](GLFWwindow* w, int key, int, int action, int) {
         if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS)
             glfwSetWindowShouldClose(w, GLFW_TRUE);
     });
 
     std::cout << "Controls:\n";
-    std::cout << "  Mouse Drag : Orbit around black hole\n";
-    std::cout << "  Scroll     : Zoom in/out\n";
-    std::cout << "  WASD       : Pan orbit center\n";
-    std::cout << "  Q/E        : Move center up/down\n";
-    std::cout << "  ESC        : Quit\n\n";
+    std::cout << "  Mouse Drag  : Orbit around black hole\n";
+    std::cout << "  Scroll      : Zoom in/out\n";
+    std::cout << "  WASD        : Pan orbit center\n";
+    std::cout << "  Q/E         : Move center up/down\n";
+    std::cout << "  +/-         : Adjust bloom strength\n";
+    std::cout << "  ESC         : Quit\n\n";
 
     float time = 0.0f;
 
-    // 4. Main Render Loop — CPU does almost nothing!
+    // 4. Main Render Loop
     while (!display.shouldClose()) {
 
         // --- Process keyboard input ---
@@ -82,10 +80,10 @@ int main() {
             display.isKeyPressed(GLFW_KEY_E)
         );
 
-        // Recalculate camera basis from spherical coordinates
         camera.update();
 
-        // --- Pass uniforms to GPU ---
+        // --- Activate scene shader and set uniforms ---
+        display.useSceneShader();
         display.setUniform2f("uResolution", (float)display.getWidth(), (float)display.getHeight());
         display.setUniform1f("uTime", time);
         display.setUniform1f("uStepSize", 0.08f);
@@ -111,10 +109,10 @@ int main() {
             (float)camera.up.y,
             (float)camera.up.z);
 
-        // --- Draw! The GPU does ALL the physics ---
+        // --- Draw! Scene → Bloom → Composite → Screen ---
         display.draw();
 
-        time += 0.016f; // ~60fps time accumulator
+        time += 0.016f;
     }
 
     std::cout << "\nEngine Shutting Down...\n";

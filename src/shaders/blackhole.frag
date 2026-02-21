@@ -140,63 +140,101 @@ vec3 starfield(vec3 dir) {
 }
 
 // ============================================================
-//  Disk shading — M87 palette with Doppler + redshift
+//  Disk shading — The disk IS flowing particles
+//  Each dot orbits at ω(r) = √(M / r³), colored by M87 gradient.
+//  Angular grid scaled by r to prevent arc-length stretching.
 // ============================================================
+
+// Helper: generate one particle layer
+// rScale = radial grid density
+// aScale = angular grid per unit radius (multiplied by diskR internally)
+float particleLayer(float diskR, float angle, float time,
+                    float rScale, float aScale,
+                    float dotSize, float threshold, float seed) {
+    float omega = sqrt(M / (diskR * diskR * diskR));
+    float flowAngle = angle + time * omega;
+
+    // KEY FIX: angular cells scale with r so dots have uniform arc-length
+    vec2 cell = vec2(diskR * rScale, flowAngle * aScale * diskR);
+    vec2 cellId = floor(cell);
+    vec2 cellUV = fract(cell);
+
+    // Random position within cell (avoids grid artifacts)
+    float rnd = hash(cellId + seed);
+    float rnd2 = hash(cellId + seed + 37.0);
+    vec2 particlePos = vec2(rnd * 0.6 + 0.2, rnd2 * 0.6 + 0.2);
+    vec2 delta = cellUV - particlePos;
+
+    // Uniform small dot
+    float dist = length(delta);
+    float particle = smoothstep(dotSize, dotSize * 0.15, dist);
+
+    // Spawn probability
+    float spawn = smoothstep(threshold, threshold + 0.04, hash(cellId + seed + 71.0));
+
+    // Flicker
+    float flicker = 0.65 + 0.35 * sin(rnd * 50.0 + time * (2.0 + rnd * 3.0));
+
+    return particle * spawn * flicker;
+}
+
 vec3 diskShade(vec3 hitPos, float diskR, vec3 camPos) {
 
-    // --- Temperature mapped to [0,1] ---
-    // T(r) ∝ (r_in/r)^(3/4)
     float r_ratio  = DISK_INNER / diskR;
-    float tempNorm = pow(r_ratio, 0.75); // 1.0 at inner edge, ~0 at outer
-
-    // --- Subtle disk structure (much less aggressive than before) ---
-    float angle = atan(hitPos.z, hitPos.x);
-    vec2 diskUV = vec2(diskR, angle * 2.0);
-
-    // Gentle spiral + turbulence (amplitude ~0.1, very subtle)
-    float spiral = sin(3.0 * angle - 6.0 * log(max(diskR, 1.0)) + uTime * 0.2) * 0.5 + 0.5;
-    float turb = fbm(diskUV * 2.0 + uTime * 0.05);
-    float structure = 0.85 + 0.1 * spiral + 0.05 * turb;
-
-    // --- Base color from M87 ramp ---
-    vec3 color = m87ColorRamp(tempNorm) * structure;
+    float tempNorm = pow(r_ratio, 0.75);
+    float angle    = atan(hitPos.z, hitPos.x);
 
     // --- Doppler beaming ---
     vec3 radialDir = normalize(vec3(hitPos.x, 0.0, hitPos.z));
     vec3 orbitDir  = normalize(cross(vec3(0.0, 1.0, 0.0), radialDir));
     float v_orb    = sqrt(M / diskR);
-    vec3 v_gas     = orbitDir * v_orb;
-
     vec3 toCamera  = normalize(camPos - hitPos);
-    float v_dot_n  = dot(v_gas, toCamera);
+    float v_dot_n  = dot(orbitDir * v_orb, toCamera);
     float gamma    = 1.0 / sqrt(max(1.0 - v_orb * v_orb, 0.01));
     float doppler  = 1.0 / (gamma * (1.0 - v_dot_n));
 
-    // Shift the color ramp position by Doppler factor
-    // Approaching side → hotter color, receding → cooler
     float dopplerTemp = clamp(tempNorm * doppler, 0.0, 1.0);
-    color = m87ColorRamp(dopplerTemp) * structure;
+    vec3 baseColor = m87ColorRamp(dopplerTemp);
 
-    // Intensity boost: I ∝ δ^3, but gentler clamping
-    float intensity = pow(clamp(doppler, 0.2, 2.5), 3.0);
+    // === BUILD DISK FROM PARTICLES (8 layers, uniform small dots) ===
+    float density = 0.0;
+
+    // Dense base layers (many tiny dots — form the body of the disk)
+    density += particleLayer(diskR, angle, uTime, 15.0, 5.0, 0.10, 0.20, 0.0)   * 0.30;
+    density += particleLayer(diskR, angle, uTime, 13.0, 4.5, 0.10, 0.22, 53.0)  * 0.30;
+    density += particleLayer(diskR, angle, uTime, 11.0, 4.0, 0.11, 0.25, 113.0) * 0.35;
+    density += particleLayer(diskR, angle, uTime, 9.0,  3.5, 0.11, 0.28, 197.0) * 0.35;
+
+    // Medium density layers (visible individual dots)
+    density += particleLayer(diskR, angle, uTime, 7.0,  3.0, 0.11, 0.40, 257.0) * 0.45;
+    density += particleLayer(diskR, angle, uTime, 5.5,  2.5, 0.12, 0.45, 337.0) * 0.50;
+
+    // Sparse bright dots (stand out, bloom catches them)
+    density += particleLayer(diskR, angle, uTime, 4.0,  2.0, 0.12, 0.65, 431.0) * 0.70;
+    density += particleLayer(diskR, angle, uTime, 3.0,  1.5, 0.12, 0.80, 619.0) * 1.0;
+
+    // Faint diffuse glow underneath
+    float omega = sqrt(M / (diskR * diskR * diskR));
+    float flowAngle = angle + uTime * omega;
+    density += fbm(vec2(diskR * 3.0, flowAngle * 5.0)) * 0.08;
+
+    density = clamp(density, 0.0, 2.5);
+
+    // --- Apply color and physics ---
+    vec3 color = baseColor * density;
+
+    float intensity = pow(clamp(doppler, 0.15, 3.5), 3.0);
     color *= intensity;
 
-    // --- Gravitational redshift ---
     float grav = sqrt(max(1.0 - RS / diskR, 0.0));
     color *= grav;
 
-    // --- Emissive radial profile ---
-    // Inner regions are intrinsically brighter (emission ∝ r^-2 ish)
     float emission = pow(r_ratio, 1.5);
     color *= (0.3 + 0.7 * emission);
 
-    // --- Soft outer fade (no hard cutoff) ---
     float outerFade = smoothstep(DISK_OUTER, DISK_OUTER - 3.0, diskR);
-    color *= outerFade;
-
-    // --- Soft inner edge transition ---
     float innerFade = smoothstep(DISK_INNER - 0.3, DISK_INNER + 0.5, diskR);
-    color *= innerFade;
+    color *= outerFade * innerFade;
 
     return color;
 }
@@ -275,24 +313,24 @@ vec3 traceRay(vec3 rayPos, vec3 rayDir) {
 }
 
 // ============================================================
-//  Post-process: soft glow / bloom approximation
-//  Uses the photon sphere impact parameter for a halo effect
+//  Post-process: photon sphere glow (HDR values for bloom)
 // ============================================================
 vec3 photonGlow(vec3 rayDir, vec3 camPos) {
     vec3 cp = cross(camPos, rayDir);
     float b = length(cp);
     float shadowR = 2.6 * RS;
 
-    // Soft, warm halo at shadow boundary
     float dist = abs(b - shadowR);
-    float glow = exp(-dist * dist * 1.5) * 0.04;
-    float halo = exp(-dist * 0.4) * 0.008;
+    // Stronger glow — bloom will spread this
+    float ring = exp(-dist * dist * 2.0) * 0.15;
+    float halo = exp(-dist * 0.3) * 0.03;
 
-    return vec3(1.0, 0.55, 0.15) * (glow + halo);
+    return vec3(1.0, 0.6, 0.2) * (ring + halo);
 }
 
 // ============================================================
-//  MAIN
+//  MAIN — outputs raw HDR linear color (no tone mapping here)
+//  Tone mapping + gamma happen in bloom_final.frag
 // ============================================================
 void main() {
     vec2 uv = fragUV * 2.0 - 1.0;
@@ -307,16 +345,10 @@ void main() {
 
     vec3 color = traceRay(uCamPos, rayDir);
 
-    // Add subtle photon sphere glow
+    // Add photon sphere glow (HDR — bloom will spread this)
     color += photonGlow(rayDir, uCamPos);
 
-    // ACES filmic tone mapping
-    vec3 x = color;
-    color = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14);
-    color = clamp(color, 0.0, 1.0);
-
-    // Gamma correction
-    color = pow(color, vec3(1.0 / 2.2));
-
+    // Output raw HDR linear — DO NOT tone map here
+    // Tone mapping + gamma happen in the bloom composite pass
     FragColor = vec4(color, 1.0);
 }
