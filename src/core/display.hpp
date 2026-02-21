@@ -105,4 +105,8 @@ class Display {
             glfwSwapBuffers(window);
             glfwPollEvents();
         }
+     
+        bool isKeyPressed(int key) {
+        return glfwGetKey(window, key) == GLFW_PRESS;
+    }
 };
