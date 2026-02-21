@@ -4,109 +4,213 @@
 #include <GLFW/glfw3.h>
 #include <cstdint>
 #include <string>
-#include <vector>
 #include <iostream>
+#include <fstream>
+#include <sstream>
 
 class Display {
-    
-    private:
-        int window_width, window_height;
-        std::string window_title;
-        GLFWwindow* window;
 
-        // OpenGL related variables
-        uint32_t textureID;
-        uint32_t pboID;
-        uint32_t fboID;
+private:
+    int window_width, window_height;
+    GLFWwindow* window;
 
-    public:
-        Display(int width, int height, const std::string& title) : window_width(width), window_height(height) {
+    // Shader program
+    GLuint shaderProgram;
 
-            if(!glfwInit()) {
-                std::cerr << "Failed to initialize GLFW" << std::endl;
-                return;
-            }
+    // Full-screen quad
+    GLuint quadVAO, quadVBO;
 
-            window = glfwCreateWindow(width, height, title.c_str(), NULL, NULL);
-            if (!window) {
-                std::cerr << "Failed to create GLFW window" << std::endl;
-                glfwTerminate();
-                return;
-            }
-            
-            glfwMakeContextCurrent(window);
+    // --- Shader compilation utility ---
+    GLuint compileShader(GLenum type, const std::string& source) {
+        GLuint shader = glCreateShader(type);
+        const char* src = source.c_str();
+        glShaderSource(shader, 1, &src, nullptr);
+        glCompileShader(shader);
 
-            if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
-                std::cerr << "Failed to initialize GLAD" << std::endl;
-                return; 
-            }
+        // Check for errors
+        int success;
+        glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+        if (!success) {
+            char infoLog[1024];
+            glGetShaderInfoLog(shader, 1024, nullptr, infoLog);
+            std::cerr << "SHADER COMPILE ERROR ("
+                      << (type == GL_VERTEX_SHADER ? "VERTEX" : "FRAGMENT")
+                      << "):\n" << infoLog << std::endl;
+            return 0;
+        }
+        return shader;
+    }
 
-            // 1. Projector screen (texture)
-            glGenTextures(1, &textureID);
-            glBindTexture(GL_TEXTURE_2D, textureID);
+    std::string loadShaderFile(const std::string& filepath) {
+        std::ifstream file(filepath);
+        if (!file.is_open()) {
+            std::cerr << "ERROR: Cannot open shader file: " << filepath << std::endl;
+            return "";
+        }
+        std::stringstream buffer;
+        buffer << file.rdbuf();
+        return buffer.str();
+    }
 
-            // 2. Scaling filters
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+public:
+    Display(int width, int height, const std::string& title,
+            const std::string& vertPath, const std::string& fragPath)
+        : window_width(width), window_height(height) {
 
-            // 3. Initialize Texture Storage (MUST happen before attaching to FBO)
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-
-            // 4. Create FBO and attach the initialized texture
-            glGenFramebuffers(1, &fboID);
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, fboID);
-            glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, textureID, 0);
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, 0); // Unbind when done
-
-            // 5. PBO
-            glGenBuffers(1, &pboID);
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pboID);
-
-            // Allocate memory in GPU for pixels
-            glBufferData(GL_PIXEL_UNPACK_BUFFER, width * height * sizeof(uint32_t), nullptr, GL_STREAM_DRAW);
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        // --- GLFW Init ---
+        if (!glfwInit()) {
+            std::cerr << "Failed to initialize GLFW" << std::endl;
+            return;
         }
 
-        ~Display() {
-            // Clean up the FBO as well!
-            glDeleteFramebuffers(1, &fboID);
-            glDeleteBuffers(1, &pboID);
-            glDeleteTextures(1, &textureID);
-            
-            if (window) {
-                glfwDestroyWindow(window);
-            }
+        // Request OpenGL 3.3 Core Profile
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+
+        window = glfwCreateWindow(width, height, title.c_str(), NULL, NULL);
+        if (!window) {
+            std::cerr << "Failed to create GLFW window" << std::endl;
             glfwTerminate();
+            return;
         }
 
-        bool shouldClose() {
-            return glfwWindowShouldClose(window);
+        glfwMakeContextCurrent(window);
+        glfwSwapInterval(1); // VSync on — prevents GPU from overworking
+
+        // Store 'this' pointer so the resize callback can update our dimensions
+        glfwSetWindowUserPointer(window, this);
+
+        // Framebuffer resize callback — keeps viewport matched to window size
+        glfwSetFramebufferSizeCallback(window, [](GLFWwindow* w, int newW, int newH) {
+            Display* self = static_cast<Display*>(glfwGetWindowUserPointer(w));
+            if (self) {
+                self->window_width = newW;
+                self->window_height = newH;
+            }
+            glViewport(0, 0, newW, newH);
+        });
+
+        if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
+            std::cerr << "Failed to initialize GLAD" << std::endl;
+            return;
         }
 
-        void update(const uint32_t* pixels) {
-            // Bind our PBO staging area
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pboID);
+        std::cout << "OpenGL Version: " << glGetString(GL_VERSION) << std::endl;
+        std::cout << "GPU: " << glGetString(GL_RENDERER) << std::endl;
 
-            // Copy C++ array to the GPU buffer
-            glBufferSubData(GL_PIXEL_UNPACK_BUFFER, 0, window_width * window_height * sizeof(uint32_t), pixels);
+        // --- Build full-screen quad ---
+        // Two triangles covering [-1,1] in NDC with UVs [0,1]
+        float quadVertices[] = {
+            // pos.x  pos.y   uv.x  uv.y
+            -1.0f, -1.0f,   0.0f, 0.0f,
+             1.0f, -1.0f,   1.0f, 0.0f,
+             1.0f,  1.0f,   1.0f, 1.0f,
 
-            // Copy from Buffer to Texture
-            glBindTexture(GL_TEXTURE_2D, textureID);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, window_width, window_height, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+            -1.0f, -1.0f,   0.0f, 0.0f,
+             1.0f,  1.0f,   1.0f, 1.0f,
+            -1.0f,  1.0f,   0.0f, 1.0f,
+        };
 
-            // Clear the screen
-            glClear(GL_COLOR_BUFFER_BIT);
+        glGenVertexArrays(1, &quadVAO);
+        glGenBuffers(1, &quadVBO);
+        glBindVertexArray(quadVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, quadVBO);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(quadVertices), quadVertices, GL_STATIC_DRAW);
 
-            // Blit from FBO to standard window screen
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, fboID);
-            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0); // 0 is the default window screen
-            glBlitFramebuffer(0, 0, window_width, window_height, 0, 0, window_width, window_height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        // Position attribute (location = 0)
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
 
-            glfwSwapBuffers(window);
-            glfwPollEvents();
+        // UV attribute (location = 1)
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+        glEnableVertexAttribArray(1);
+
+        glBindVertexArray(0);
+
+        // --- Compile & link shaders ---
+        std::string vertSrc = loadShaderFile(vertPath);
+        std::string fragSrc = loadShaderFile(fragPath);
+
+        if (vertSrc.empty() || fragSrc.empty()) {
+            std::cerr << "Failed to load shader files!" << std::endl;
+            return;
         }
-     
-        bool isKeyPressed(int key) {
+
+        GLuint vertShader = compileShader(GL_VERTEX_SHADER, vertSrc);
+        GLuint fragShader = compileShader(GL_FRAGMENT_SHADER, fragSrc);
+
+        if (!vertShader || !fragShader) {
+            std::cerr << "Shader compilation failed! Aborting." << std::endl;
+            return;
+        }
+
+        shaderProgram = glCreateProgram();
+        glAttachShader(shaderProgram, vertShader);
+        glAttachShader(shaderProgram, fragShader);
+        glLinkProgram(shaderProgram);
+
+        // Check linking
+        int success;
+        glGetProgramiv(shaderProgram, GL_LINK_STATUS, &success);
+        if (!success) {
+            char infoLog[1024];
+            glGetProgramInfoLog(shaderProgram, 1024, nullptr, infoLog);
+            std::cerr << "SHADER LINK ERROR:\n" << infoLog << std::endl;
+        }
+
+        // Clean up individual shaders (they're now in the program)
+        glDeleteShader(vertShader);
+        glDeleteShader(fragShader);
+
+        // Activate the shader program
+        glUseProgram(shaderProgram);
+    }
+
+    ~Display() {
+        glDeleteVertexArrays(1, &quadVAO);
+        glDeleteBuffers(1, &quadVBO);
+        glDeleteProgram(shaderProgram);
+
+        if (window) {
+            glfwDestroyWindow(window);
+        }
+        glfwTerminate();
+    }
+
+    // --- Uniform setters ---
+    void setUniform1f(const char* name, float v) {
+        glUniform1f(glGetUniformLocation(shaderProgram, name), v);
+    }
+
+    void setUniform2f(const char* name, float x, float y) {
+        glUniform2f(glGetUniformLocation(shaderProgram, name), x, y);
+    }
+
+    void setUniform3f(const char* name, float x, float y, float z) {
+        glUniform3f(glGetUniformLocation(shaderProgram, name), x, y, z);
+    }
+
+    // --- Draw the full-screen quad (triggers fragment shader on every pixel) ---
+    void draw() {
+        glClear(GL_COLOR_BUFFER_BIT);
+        glBindVertexArray(quadVAO);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        glBindVertexArray(0);
+
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+    }
+
+    bool shouldClose() {
+        return glfwWindowShouldClose(window);
+    }
+
+    bool isKeyPressed(int key) {
         return glfwGetKey(window, key) == GLFW_PRESS;
     }
+
+    GLFWwindow* getWindow() { return window; }
+    int getWidth() const { return window_width; }
+    int getHeight() const { return window_height; }
 };
